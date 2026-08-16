@@ -15,9 +15,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ffmpeg — BE 가 보내는 ogg/opus·m4a 를 확실히 디코딩하려면 필요하다(server.py 주석 참고).
 # python3-venv — Ubuntu 24.04 는 PEP 668 로 시스템 파이썬에 pip 설치를 막으므로 venv 를 쓴다
 # (`--break-system-packages` 로 뚫는 것보다 안전하다 — OS 패키지와 섞이지 않는다).
+# ★ gcc/g++ — **런타임에 필요하다.** vLLM 은 torch.compile(Inductor+Triton)로 GPU 커널을
+# 그 자리에서 컴파일하므로 C 컴파일러가 없으면 엔진 기동이 죽는다(실측 2026-08-16 · 첫 배포:
+# `InductorError: RuntimeError: Failed to find C compiler`). vllm-openai 베이스에는 들어
+# 있었는데 CUDA runtime 베이스로 슬림화하면서 빠졌다. 수십 MB 라 이미지 크기 영향은 없다.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-dev ffmpeg \
+        python3 python3-venv python3-dev ffmpeg gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
 ENV VIRTUAL_ENV=/opt/venv
