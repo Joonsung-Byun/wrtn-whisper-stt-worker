@@ -1,0 +1,7 @@
+# torch·vllm 은 베이스 이미지(vllm/vllm-openai)에 이미 있다 — 여기서 다시 고정하면
+# 베이스와 버전이 어긋나 CUDA 초기화가 깨진다. 새로 필요한 것만 적는다.
+qwen-asr
+fastapi
+uvicorn[standard]
+numpy
+huggingface_hub[cli]
