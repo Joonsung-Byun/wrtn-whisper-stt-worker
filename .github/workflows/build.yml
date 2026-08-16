@@ -53,8 +53,6 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
-          # ★ 가중치는 굽지 않는다 — RunPod Cached model 이 대신한다(Dockerfile 주석 참고).
-          # 구웠더니 이미지가 압축 13.76GB 가 되어 워커가 뜨지 못했다(실측 2026-08-16).
-          build-args: BAKE_WEIGHTS=0
-          # ⚠️ GHA 캐시는 레포당 10GB 상한이라 18GB 이미지에는 쓸 수 없다. 억지로 켜면
-          # 캐시가 계속 밀려나 빌드가 느려지기만 한다 — 껐다.
+          # 공식 vLLM 이미지 위에 오디오 확장(librosa·soundfile)만 얹는 얇은 레이어다.
+          # 가중치도 굽지 않고 추가 의존성도 없어 새로 쌓이는 레이어는 수십 MB 수준이다.
+          # ⚠️ GHA 캐시는 레포당 10GB 상한이라 이 베이스(압축 ~10GB)에는 쓸 수 없다 — 껐다.
