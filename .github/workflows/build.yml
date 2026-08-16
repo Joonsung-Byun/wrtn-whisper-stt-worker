@@ -7,9 +7,6 @@ on:
     branches: [main]
   workflow_dispatch:
 
-env:
-  IMAGE: ghcr.io/${{ github.repository }}
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,6 +24,11 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo rm -rf /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h /
+
+      # ⚠️ ghcr 태그는 소문자만 받는다. github.repository 는 계정명 대소문자를 그대로 주므로
+      # (Joonsung-Byun/...) 그대로 쓰면 "repository name must be lowercase" 로 빌드가 죽는다.
+      - name: compute lowercase image name
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
       - uses: docker/setup-buildx-action@v3
 
