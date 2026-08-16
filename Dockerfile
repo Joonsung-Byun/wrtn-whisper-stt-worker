@@ -3,7 +3,12 @@
 # 베이스를 vllm/vllm-openai 로 잡은 이유: torch·CUDA·vLLM 이 이미 맞물려 들어가 있어
 # nvidia/cuda 에서 직접 쌓는 것보다 빌드가 훨씬 짧고 버전 충돌이 없다. ENTRYPOINT 는
 # vLLM 서버라 아래에서 비운다.
-FROM vllm/vllm-openai:latest
+#
+# ★ 태그를 :latest 가 아니라 **v0.14.0 으로 못박는다.** qwen-asr[vllm] 이 vllm==0.14.0 을
+# 정확히 요구하므로, latest 를 쓰면 pip 가 vllm 을 갈아끼우면서 베이스의 CUDA 스택까지
+# 건드린다(실측 2026-08-16 — nvidia-nccl-cu13 제거). 버전을 맞춰두면 pip 는 "이미 충족"
+# 으로 넘어가고 torch·vllm 은 그대로 남는다. requirements.txt 의 핀과 **짝으로** 올린다.
+FROM vllm/vllm-openai:v0.14.0
 
 ENTRYPOINT []
 
@@ -15,7 +20,11 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# ⚠️ `--ignore-installed blinker` — 베이스의 blinker 1.4 는 OS 패키지(distutils)로 깔려 있어
+# pip 가 "어떤 파일이 이 패키지 것인지 알 수 없다"며 제거를 거부하고 설치 전체를 실패시킨다
+# (실측 2026-08-16). qwen-asr 가 flask 를 필수 의존성으로 끌고 오는 한 이 충돌은 피할 수 없어,
+# 해당 패키지만 덮어쓰기로 지나간다.
+RUN pip install --no-cache-dir --ignore-installed blinker -r requirements.txt
 
 # ★ 가중치를 이미지에 굽는다. 서버리스는 콜드스타트가 곧 과금이라, 워커가 뜰 때마다
 # HF 에서 ~8GB 를 받으면 첫 요청이 수십 초 늦고 그 시간도 청구된다. 이미지가 커지는 대신
