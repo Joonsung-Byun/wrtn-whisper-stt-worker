@@ -5,6 +5,8 @@ name: build and push image
 on:
   push:
     branches: [main]
+    # 문서만 고칠 때 6분짜리 이미지 빌드를 돌리지 않는다.
+    paths-ignore: ['**.md']
   workflow_dispatch:
 
 jobs:

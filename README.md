@@ -1,109 +1,73 @@
 # wrtn-whisper STT worker (Qwen3-ASR-1.7B on RunPod Serverless)
 
-OpenRouter 로 나가던 1차 텍스트 레인을 RunPod 서버리스 GPU 로 옮기기 위한 워커다.
-`Qwen3-ASR-1.7B` + `Qwen3-ForcedAligner-0.6B` 를 얹고, BE 가 이미 쓰고 있는
-**OpenAI 호환 `POST /audio/transcriptions`** 계약을 그대로 흉내낸다.
+OpenRouter 로 나가던 STT 를 RunPod 서버리스 GPU 로 옮기기 위한 워커.
+**공식 vLLM 이미지에 오디오 확장만 얹은 20줄짜리 Dockerfile 이 전부다.**
 
-## 왜 이 모양인가
+## 왜 이렇게 작은가
 
-- **왜 Load Balancing 엔드포인트인가** — RunPod 큐 엔드포인트는 `POST /runsync` + `{"input": ...}`
-  봉투를 강제해서 BE 의 전송 코드를 고쳐야 한다. Load Balancing 은 워커의 HTTP 서버로 직결돼
-  커스텀 경로가 살아나므로, BE 는 **base URL 만 바뀌고 전송 코드는 그대로**다.
-- **왜 1.7B 인가** — `qwen3-asr-flash` 는 오픈웨이트가 없다(API 전용). 자체 호스팅 가능한 계열은
-  `0.6B` / `1.7B` / `ForcedAligner-0.6B` 뿐이다.
-- **1.7B 로 내려가면 잃는 것과 얻는 것** — 본문 품질은 flash 보다 한 급 아래다(사내 실측: 같은
-  300초 조각에서 글자 −13%, 중국어 혼입, 앞 절 누락). 대신 **flash 가 구조적으로 못 주던 word
-  타임스탬프가 돌아온다** — flash 는 `verbose_json` 을 400 으로 거부해서 단어 하이라이팅이 꺼져
-  있었다. 정렬기를 붙이면 격자 병렬·침묵 분할·단어 하이라이팅이 설정만으로 부활한다.
+처음에는 `qwen-asr` 패키지 + 직접 짠 FastAPI 서버로 쌓았다. 전부 불필요했다 —
+**vLLM 이 Qwen3-ASR 을 정식 지원하고 OpenAI 호환 `/v1/audio/transcriptions` 를 그대로 준다.**
+커스텀 이미지는 RunPod 워커가 로그 한 줄 없이 `initializing` 에서 나오지 못했고 원인을
+특정하지 못한 반면, 공식 이미지는 같은 조건에서 뜨고 에러도 정확히 뱉었다. 직접 쌓지 않는다.
+
+## 실측 (2026-08-17 · PRO 6000 MIG 24GB · US-WA-1)
+
+| 항목 | 값 |
+| --- | --- |
+| 30초 오디오 전사 | **5.5초** (실시간의 1/5.5) |
+| 5초 오디오 전사 | 2.6초 |
+| 콜드 스타트 | **176~246초** |
+| └ 이미지 pull + 컨테이너 | ~4분 (머신 캐시되면 사라짐) |
+| └ **엔진 초기화** | `--enforce-eager` 로 **8분 → 대폭 감소** ★ 최대 병목이었다 |
+| └ 모델 가중치 다운로드 | **17초** (1.7B 는 작다 — 여기 최적화할 가치 없음) |
+| 요금 | $0.69/hr, 도는 동안만 |
+
+⚠️ **"모델을 미리 받아두면 콜드스타트가 준다" 는 틀렸다.** 다운로드는 17초뿐이고 병목은
+엔진 초기화였다. 가중치를 이미지에 굽는 시도(압축 13.76GB)는 오히려 워커를 못 뜨게 만들었다.
+
+## 구성
+
+```
+이미지        ghcr.io/joonsung-byun/wrtn-whisper-stt-worker:<커밋 sha>
+시작 명령     Qwen/Qwen3-ASR-1.7B --host 0.0.0.0 --port 80
+              --gpu-memory-utilization 0.85 --max-model-len 8192 --enforce-eager
+엔드포인트    Load balancer (Queue 아님) · 헬스체크 /health
+컨테이너 디스크 60GB · HTTP 포트 80 · 워커 0~2 · FlashBoot on · 네트워크 볼륨 없음
+```
+
+## 밟은 지뢰 (같은 함정 반복 금지)
+
+1. **시작 명령에 `vllm serve` 를 쓰지 않는다.** 베이스 ENTRYPOINT 가 이미 `vllm serve` 라
+   중복되어 `unrecognized arguments` 로 2초 만에 죽는다. **모델명과 옵션만** 넣는다.
+2. **`vllm/vllm-openai` 태그는 최신이어야 한다.** v0.14.0 은 `qwen3_asr` 아키텍처를 모른다
+   ("Transformers does not recognize this architecture"). 지원은 0.27 대부터.
+3. **공식 이미지에는 오디오 확장이 없다.** 그대로 쓰면 전사 요청이
+   `Failed to load audio via soundfile: ImportError('Please install vllm[audio]')` 로 400.
+   → 이 레포가 `librosa`·`soundfile` 을 얹는 이유.
+4. **RunPod 은 `:latest` 를 캐시해 새 빌드를 자동으로 받지 않는다.** 반드시 **커밋 sha 태그**로
+   Manage → New release. 같은 태그를 다시 넣으면 배포 버튼이 잠긴다.
+5. **실패한 워커를 RunPod 이 자동으로 걷지 않는다.** 롤아웃 중 구 릴리스 워커가 트래픽을
+   가로채 "고쳤는데 같은 에러" 처럼 보인다. Workers 탭에서 `Outdated` 를 직접 종료하고,
+   **워커 버전이 전부 Latest 인지 확인한 뒤** 테스트한다. 이 함정에 세 번 속았다.
 
 ## API
 
-### `POST /audio/transcriptions`
-
-BE `server/services/whisper_hybrid.py` 의 `_whisper_chunk_request` 가 보내는 본문 그대로다.
-
-```json
-{
-  "model": "Qwen/Qwen3-ASR-1.7B",
-  "input_audio": { "data": "<base64>", "format": "ogg" },
-  "language": "ko",
-  "temperature": 0,
-  "response_format": "verbose_json",
-  "timestamp_granularities": ["word"]
-}
-```
-
-응답 — BE 는 `timestamp_granularities` 유무에 따라 둘 중 하나만 읽는다.
-
-```json
-{ "text": "...", "usage": { "seconds": 300 },
-  "words": [{ "word": "안녕하세요", "start": 0.4, "end": 1.1 }] }
-```
-
-### `GET /ping`
-
-RunPod 헬스체크. `200` 정상 · `204` 초기화 중 · `503` 로딩 실패(사유 포함).
-로딩 실패 시 프로세스를 죽이지 않는 이유는 `server.py` 주석 참고 — 죽으면 RunPod 이 재시작만
-반복해서 원인이 안 보인다.
-
-## 환경변수
-
-| 이름 | 기본값 | 설명 |
-| --- | --- | --- |
-| `QWEN_ASR_MODEL` | `Qwen/Qwen3-ASR-1.7B` | 본문 모델 |
-| `QWEN_ALIGNER_MODEL` | `Qwen/Qwen3-ForcedAligner-0.6B` | 타임스탬프 정렬기 |
-| `QWEN_ASR_BACKEND` | `vllm` | `vllm` \| `transformers` |
-| `QWEN_GPU_MEMORY_UTILIZATION` | `0.85` | vLLM VRAM 점유율 |
-| `QWEN_MAX_BATCH` | `8` | 마이크로 배치 최대 건수 |
-| `QWEN_BATCH_WAIT_MS` | `150` | 동료 요청 대기(0 이면 배칭 없음) |
-| `STT_API_KEY` | (빈값) | 설정 시 `Authorization: Bearer` 검사 |
-| `PORT` | `80` | RunPod 이 주입 |
-
-## 배포 (RunPod)
-
-1. 이 레포를 github.com 에 올린다(사내 엔터프라이즈 GitHub 은 Actions·RunPod 어느 쪽도
-   쓸 수 없다).
-2. push 하면 `.github/workflows/build.yml` 이 amd64 이미지를 구워
-   `ghcr.io/<owner>/<repo>:latest` 로 올린다. 맥(arm64)에서 CUDA 이미지를 구울 필요가 없다.
-3. ghcr 패키지를 **public 으로 바꾸거나**, private 로 두고 RunPod 엔드포인트에 registry
-   credential 을 등록한다.
-4. RunPod 콘솔 → Serverless → New endpoint → **Deploy from a Docker image** → 위 이미지.
-   ⚠️ **태그는 `:latest` 가 아니라 커밋 sha 를 쓴다.** RunPod 은 태그를 워커 머신에 캐시해
-   두고 다시 받지 않아서, `:latest` 로 두면 새로 빌드해도 워커가 **옛 이미지를 계속 쓴다**
-   (실측 2026-08-16 — gcc 수정이 반영 안 돼 같은 에러가 재현됐고, 워커 기동 시각과 빌드
-   완료 시각을 대조해서야 원인이 갈렸다). 갱신은 Manage → **New release** 에 새 sha 태그를
-   넣어 롤링 배포한다 — 같은 태그를 다시 넣으면 배포 버튼이 잠긴다.
-5. **Endpoint type 을 Load balancer 로** 둔다(Queue 아님 — 위 "왜" 참고).
-6. GPU 24GB 급(L4 권장 — 1.7B+0.6B 합쳐 ~8GB 라 충분하고 24GB 중 가장 싸다).
-7. **네트워크 볼륨은 붙이지 않는다.** 아래 ⚠️ 참고.
-8. 배포 후 `https://<ENDPOINT_ID>.api.runpod.ai/ping` 이 200 이 되는지 먼저 확인한다.
-
-⚠️ **가중치는 이미지에 굽는다**(CI 가 `BAKE_WEIGHTS=1`, 이미지 ~18GB). 콜드스타트에서
-"이미지 받기 + 가중치 받기" 두 단계를 **한 번의 pull 로 합치는** 것이 목적이다 — RunPod 이
-이미지를 워커 머신에 캐싱하므로 두 번째 부팅부터는 받는 단계가 사라진다.
-
-네트워크 볼륨을 **쓰지 않는 이유**: 볼륨은 데이터센터 한 곳에 묶이고, 그러면 그 지역에 있는
-GPU 만 쓸 수 있다. 실측(2026-08-16) 결과 싼 24GB 풀이 있는 지역과 볼륨 가용 지역이 어긋났고
-(일본은 H100/H200 만), 볼륨은 가중치 8GB 만 아껴줄 뿐 **이미지 10GB pull 은 그대로 남는다**.
-비용도 거의 같아서 이점이 없다.
-
-빌드가 러너 디스크로 실패하면 `BAKE_WEIGHTS=0` 으로 되돌리고 볼륨 방식으로 간다.
-
-## BE 연결
-
-BE 는 코드 변경 없이 env 로 붙일 수 있다. **단, 지금은 1차·폴백이 같은
-`OPENROUTER_BASE_URL` 을 공유한다** — 여기를 RunPod 으로 돌리면 chirp-3 폴백까지 함께 끌려간다.
-폴백을 OpenRouter 에 남기려면 `_ModelSpec` 에 base_url·api_key 를 실어 1차와 폴백을 갈라야 한다
-(BE 쪽 후속 작업).
-
-폴백을 끈 채 1차만 옮기는 최소 구성:
-
 ```bash
-OPENROUTER_BASE_URL=https://<ENDPOINT_ID>.api.runpod.ai
-OPENROUTER_API_KEY=<STT_API_KEY 와 같은 값>
-OPENROUTER_STT_MODEL=Qwen/Qwen3-ASR-1.7B
-OPENROUTER_STT_WORD_TIMESTAMPS=true   # 정렬기가 붙어 있으므로 되켠다
-OPENROUTER_STT_AUDIO_FORMAT=ogg
-OPENROUTER_STT_CHUNK_SEC=300
-OPENROUTER_STT_FALLBACK_MODEL=        # 빈 값 = chirp 폴백 비활성
+curl -H "Authorization: Bearer $RUNPOD_API_KEY" \
+     -F "file=@meeting.wav" -F "model=Qwen/Qwen3-ASR-1.7B" \
+     https://<ENDPOINT_ID>.api.runpod.ai/v1/audio/transcriptions
+# → {"text": "...", "usage": {"type": "duration", "seconds": 30}}
 ```
+
+⚠️ **multipart 파일 업로드**다. BE 현행(`whisper_hybrid._whisper_chunk_request`)은
+JSON + base64(`input_audio.data`) 로 보내므로 **BE 전송 코드 수정이 필요하다.**
+단어 타임스탬프는 이 경로에 없다(현행 flash 와 동일하게 꺼진 상태).
+
+## 콜드 스타트 대응
+
+3~4시간에 한 번 쓰는 패턴이면 매 요청이 콜드 스타트다. 그러나 전사는 백그라운드 작업이고
+**업로드 시작 시점에 워커를 깨우면** 업로드+화자분리(~2분) 뒤에 전사가 오므로 3분짜리
+콜드 스타트가 대체로 가려진다 — 업로드→요약 전체가 5분 안에 들어오는 그림.
+
+상시 켜기는 월 27만 원(Pod)~50만 원(서버리스 상시)이라 이 용량에는 과하다.
+**3분마다 핑을 보내 살려두는 것도 결국 24시간 과금이라 같은 이야기다.**
