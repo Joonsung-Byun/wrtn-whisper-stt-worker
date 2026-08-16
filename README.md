@@ -68,6 +68,11 @@ RunPod 헬스체크. `200` 정상 · `204` 초기화 중 · `503` 로딩 실패(
 3. ghcr 패키지를 **public 으로 바꾸거나**, private 로 두고 RunPod 엔드포인트에 registry
    credential 을 등록한다.
 4. RunPod 콘솔 → Serverless → New endpoint → **Deploy from a Docker image** → 위 이미지.
+   ⚠️ **태그는 `:latest` 가 아니라 커밋 sha 를 쓴다.** RunPod 은 태그를 워커 머신에 캐시해
+   두고 다시 받지 않아서, `:latest` 로 두면 새로 빌드해도 워커가 **옛 이미지를 계속 쓴다**
+   (실측 2026-08-16 — gcc 수정이 반영 안 돼 같은 에러가 재현됐고, 워커 기동 시각과 빌드
+   완료 시각을 대조해서야 원인이 갈렸다). 갱신은 Manage → **New release** 에 새 sha 태그를
+   넣어 롤링 배포한다 — 같은 태그를 다시 넣으면 배포 버튼이 잠긴다.
 5. **Endpoint type 을 Load balancer 로** 둔다(Queue 아님 — 위 "왜" 참고).
 6. GPU 24GB 급(L4 권장 — 1.7B+0.6B 합쳐 ~8GB 라 충분하고 24GB 중 가장 싸다).
 7. **네트워크 볼륨은 붙이지 않는다.** 아래 ⚠️ 참고.
