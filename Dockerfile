@@ -24,9 +24,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 네트워크 볼륨을 붙여 HF_HOME 을 그 위로 보낸다.
 ARG BAKE_WEIGHTS=1
 ENV HF_HOME=/models
+# ⚠️ 다운로드 CLI 이름이 판올림 중이다 — 최신 huggingface_hub 은 `hf`, 구버전은
+# `huggingface-cli` 다. 둘 중 있는 쪽을 쓴다(한쪽만 박으면 베이스 이미지 갱신에 깨진다).
 RUN if [ "$BAKE_WEIGHTS" = "1" ]; then \
-        huggingface-cli download Qwen/Qwen3-ASR-1.7B && \
-        huggingface-cli download Qwen/Qwen3-ForcedAligner-0.6B ; \
+        if command -v hf >/dev/null 2>&1; then DL="hf download"; \
+        else DL="huggingface-cli download"; fi && \
+        $DL Qwen/Qwen3-ASR-1.7B && \
+        $DL Qwen/Qwen3-ForcedAligner-0.6B && \
+        du -sh /models ; \
     fi
 
 COPY server.py .

@@ -19,10 +19,16 @@ jobs:
 
       # ★ 러너 디스크를 비운다. 베이스(vllm/vllm-openai)만 ~8GB 라 기본 상태로는 빌드 중
       # "no space left on device" 로 죽는다. 안 쓰는 사전설치 툴체인을 걷어내면 ~20GB 가 는다.
+      # ★ 러너 디스크를 비운다. 베이스(vllm/vllm-openai) 압축 해제분에 **가중치 8GB 까지**
+      # 얹으므로 기본 상태(여유 ~14GB)로는 "no space left on device" 로 죽는다. 안 쓰는
+      # 사전설치 툴체인·도커 프리로드 이미지를 걷어내면 ~40GB 대까지 확보된다.
       - name: free disk space
         run: |
+          df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo rm -rf /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/share/boost /opt/hostedtoolcache "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/share/powershell /usr/share/swift
+          docker image prune -af
           df -h /
 
       # ⚠️ ghcr 태그는 소문자만 받는다. github.repository 는 계정명 대소문자를 그대로 주므로
@@ -47,10 +53,10 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
-          # ⚠️ 가중치는 이미지에 굽지 않는다(BAKE_WEIGHTS=0). GitHub 호스티드 러너 디스크로는
-          # 베이스 8GB + 가중치 8GB + 레이어 사본을 감당하지 못한다. 대신 RunPod 쪽에
-          # 네트워크 볼륨을 붙이고 HF_HOME 을 그 위로 보내 콜드스타트를 흡수한다
-          # (README 배포 절차 참고). 굽고 싶으면 self-hosted 러너에서 1 로 올린다.
-          build-args: BAKE_WEIGHTS=0
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # ★ 가중치를 이미지에 굽는다. 서버리스 콜드스타트에서 "상자 받기 + 모델 받기" 두
+          # 단계를 **한 번의 이미지 pull 로 합치는** 것이 목적이다 — RunPod 이 이미지를 워커
+          # 머신에 캐싱하므로 두 번째 부팅부터는 받는 단계 자체가 사라진다. 네트워크 볼륨을
+          # 쓰지 않으므로 데이터센터가 한 곳에 묶이지 않는다(싼 24GB 풀을 그대로 쓴다).
+          build-args: BAKE_WEIGHTS=1
+          # ⚠️ GHA 캐시는 레포당 10GB 상한이라 18GB 이미지에는 쓸 수 없다. 억지로 켜면
+          # 캐시가 계속 밀려나 빌드가 느려지기만 한다 — 껐다.
