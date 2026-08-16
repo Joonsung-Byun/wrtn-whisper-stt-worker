@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import inspect
 import logging
 import os
 import subprocess
@@ -111,30 +112,53 @@ def _decode_audio(raw: bytes) -> np.ndarray:
 # ───────────────────────────── 모델 로딩 ─────────────────────────────
 
 
+def _accepts(func: Any, name: str) -> bool:
+    """`func` 가 `name` 키워드 인자를 받는가.
+
+    ★ 왜 추측하지 않고 물어보나: qwen-asr 는 `forced_aligner` 를 **생성자에서 받는 판과
+    transcribe() 에서 받는 판이 갈린다** — HF 모델 카드는 생성자로, GitHub README 는
+    transcribe() 인자로 적어 두 문서가 서로 어긋난다. 0.0.6 실측(2026-08-16)은 생성자 쪽이고,
+    transcribe() 에 넘기면 `TypeError: unexpected keyword argument 'forced_aligner'` 로 죽는다.
+    판올림 때 또 뒤집힐 수 있어 문서 대신 실제 시그니처를 본다."""
+    try:
+        return name in inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _load_model() -> Any:
     from qwen_asr import Qwen3ASRModel
 
-    # ⚠️ forced_aligner 는 생성자가 아니라 transcribe() 의 인자다(공식 시그니처). 여기서
-    # 넘기면 TypeError 다 — 대신 _run_batch 가 매 호출에 넘기고, 지연 로딩 비용은 아래
-    # 워밍업 1회가 흡수한다.
     if BACKEND == "vllm":
-        logger.info("vLLM 백엔드로 %s 로딩", MODEL_PATH)
-        return Qwen3ASRModel.LLM(
-            model=MODEL_PATH,
-            gpu_memory_utilization=GPU_MEM_UTIL,
-            max_new_tokens=MAX_NEW_TOKENS,
-        )
+        factory = Qwen3ASRModel.LLM
+        kwargs: dict[str, Any] = {
+            "model": MODEL_PATH,
+            "gpu_memory_utilization": GPU_MEM_UTIL,
+            "max_new_tokens": MAX_NEW_TOKENS,
+        }
+    else:
+        import torch
 
-    import torch
+        factory = Qwen3ASRModel.from_pretrained
+        kwargs = {
+            "dtype": torch.bfloat16,
+            "device_map": "cuda:0",
+            "max_inference_batch_size": MAX_BATCH,
+            "max_new_tokens": MAX_NEW_TOKENS,
+        }
 
-    logger.info("transformers 백엔드로 %s 로딩", MODEL_PATH)
-    return Qwen3ASRModel.from_pretrained(
-        MODEL_PATH,
-        dtype=torch.bfloat16,
-        device_map="cuda:0",
-        max_inference_batch_size=MAX_BATCH,
-        max_new_tokens=MAX_NEW_TOKENS,
+    # 정렬기는 생성자와 transcribe() 중 **이 판이 받는 쪽**에 붙인다(_accepts 주석 참고).
+    if _accepts(factory, "forced_aligner"):
+        kwargs["forced_aligner"] = ALIGNER_PATH
+
+    logger.info(
+        "%s 백엔드로 %s 로딩 (정렬기 %s)",
+        BACKEND, MODEL_PATH,
+        "생성자에 부착" if "forced_aligner" in kwargs else "transcribe 시 부착",
     )
+    if BACKEND == "vllm":
+        return factory(**kwargs)
+    return factory(MODEL_PATH, **kwargs)
 
 
 # ───────────────────────────── 배치 실행 ─────────────────────────────
@@ -187,8 +211,8 @@ def _run_batch(jobs: list[_Job]) -> list[tuple[str, list[dict[str, Any]]]]:
     """블로킹 추론 1회. 배치 안의 언어·타임스탬프 요구가 섞이면 안 되므로 호출자가 갈라 준다."""
     want_timestamps = jobs[0].want_timestamps
     kwargs: dict[str, Any] = {}
-    if want_timestamps:
-        # 정렬기는 타임스탬프를 요구할 때만 붙인다 — 안 쓰는 요청에 얹으면 VRAM·시간만 든다.
+    # 생성자가 정렬기를 안 받는 판이라면 여기서 붙인다 — 둘 중 한 곳에만 들어가야 한다.
+    if want_timestamps and _accepts(_model.transcribe, "forced_aligner"):
         kwargs["forced_aligner"] = ALIGNER_PATH
     results = _model.transcribe(
         audio=[(job.audio, SR) for job in jobs],
