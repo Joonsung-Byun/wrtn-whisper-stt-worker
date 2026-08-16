@@ -33,13 +33,17 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# ★ 가중치를 이미지에 굽는다. 서버리스는 콜드스타트가 곧 과금이라, 워커가 뜰 때마다
-# HF 에서 ~8GB 를 받으면 첫 요청이 늦고 그 시간도 청구된다. 이미지가 커지는 대신 워커
-# 머신에 캐시되므로 두 번째 부팅부터는 받는 단계가 사라진다.
-# 굽지 않으려면 --build-arg BAKE_WEIGHTS=0 으로 끄고 RunPod 에 네트워크 볼륨을 붙여
-# HF_HOME 을 그 위로 보낸다(데이터센터가 한 곳에 묶이는 대가가 있다 — README 참고).
-ARG BAKE_WEIGHTS=1
-ENV HF_HOME=/models
+# ★ 가중치는 **굽지 않는다**(기본 0). RunPod 의 **Cached model** 이 같은 일을 더 잘 한다 —
+# 모델을 호스트 머신에 캐시해 두고 이미 가진 호스트로 워커를 배정하며, 캐시가 없어 받는
+# 동안은 과금도 하지 않는다. 마운트 위치가 `/runpod-volume/huggingface-cache/hub/` 라
+# HF 규약과 같아서 HF_HOME 만 그리로 보내면 코드는 그대로 쓴다.
+#
+# ⚠️ 실패 이력(2026-08-16): 콜드스타트를 줄이려고 가중치를 구웠더니 이미지가 **압축 13.76GB**
+# (가중치 레이어만 5.13GB)가 되어 워커가 35분 넘게 `initializing` 에서 나오지 못했다.
+# 줄이려던 콜드스타트를 오히려 못 넘게 만든 셈이라 되돌린다. 굽고 싶으면 build-arg 로 1.
+ARG BAKE_WEIGHTS=0
+# RunPod Cached model 마운트 지점. 볼륨이 없으면 HF 가 이 경로에 직접 받는다(동작은 동일).
+ENV HF_HOME=/runpod-volume/huggingface-cache
 # ⚠️ 다운로드 CLI 이름이 판올림 중이다 — 최신 huggingface_hub 은 `hf`, 구버전은
 # `huggingface-cli` 다. 둘 중 있는 쪽을 쓴다(한쪽만 박으면 판올림에 깨진다).
 RUN if [ "$BAKE_WEIGHTS" = "1" ]; then \
