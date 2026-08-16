@@ -40,6 +40,22 @@ logger = logging.getLogger("stt-worker")
 
 SR = 16_000  # Qwen3-ASR 입력 샘플레이트. 그 외는 ffmpeg 가 여기로 맞춘다.
 
+# ★ Qwen3-ASR 의 language 는 ISO 코드가 아니라 **언어 이름**이다("Korean"). BE 는 word
+# 타임스탬프 경로에서 "ko" 를 보내므로(whisper 계약) 여기서 갈아끼운다. 안 바꾸면 강제
+# 지정이 조용히 무시돼 자동 감지로 떨어진다 — 에러가 아니라서 더 늦게 발견된다.
+LANGUAGE_NAMES = {
+    "ko": "Korean", "en": "English", "zh": "Chinese",
+    "ja": "Japanese", "es": "Spanish", "fr": "French", "de": "German",
+}
+
+
+def _language_name(value: str | None) -> str | None:
+    """ISO 코드면 이름으로, 이미 이름이면 그대로, 빈 값이면 None(자동 감지)."""
+    if not value:
+        return None
+    return LANGUAGE_NAMES.get(value.strip().lower(), value)
+
+
 MODEL_PATH = os.getenv("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
 ALIGNER_PATH = os.getenv("QWEN_ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
 BACKEND = os.getenv("QWEN_ASR_BACKEND", "vllm")  # vllm | transformers
@@ -98,21 +114,22 @@ def _decode_audio(raw: bytes) -> np.ndarray:
 def _load_model() -> Any:
     from qwen_asr import Qwen3ASRModel
 
+    # ⚠️ forced_aligner 는 생성자가 아니라 transcribe() 의 인자다(공식 시그니처). 여기서
+    # 넘기면 TypeError 다 — 대신 _run_batch 가 매 호출에 넘기고, 지연 로딩 비용은 아래
+    # 워밍업 1회가 흡수한다.
     if BACKEND == "vllm":
-        logger.info("vLLM 백엔드로 %s 로딩 (aligner=%s)", MODEL_PATH, ALIGNER_PATH)
+        logger.info("vLLM 백엔드로 %s 로딩", MODEL_PATH)
         return Qwen3ASRModel.LLM(
             model=MODEL_PATH,
-            forced_aligner=ALIGNER_PATH,
             gpu_memory_utilization=GPU_MEM_UTIL,
             max_new_tokens=MAX_NEW_TOKENS,
         )
 
     import torch
 
-    logger.info("transformers 백엔드로 %s 로딩 (aligner=%s)", MODEL_PATH, ALIGNER_PATH)
+    logger.info("transformers 백엔드로 %s 로딩", MODEL_PATH)
     return Qwen3ASRModel.from_pretrained(
         MODEL_PATH,
-        forced_aligner=ALIGNER_PATH,
         dtype=torch.bfloat16,
         device_map="cuda:0",
         max_inference_batch_size=MAX_BATCH,
@@ -169,10 +186,15 @@ def _normalize_words(entries: Any, duration: float) -> list[dict[str, Any]]:
 def _run_batch(jobs: list[_Job]) -> list[tuple[str, list[dict[str, Any]]]]:
     """블로킹 추론 1회. 배치 안의 언어·타임스탬프 요구가 섞이면 안 되므로 호출자가 갈라 준다."""
     want_timestamps = jobs[0].want_timestamps
+    kwargs: dict[str, Any] = {}
+    if want_timestamps:
+        # 정렬기는 타임스탬프를 요구할 때만 붙인다 — 안 쓰는 요청에 얹으면 VRAM·시간만 든다.
+        kwargs["forced_aligner"] = ALIGNER_PATH
     results = _model.transcribe(
         audio=[(job.audio, SR) for job in jobs],
         language=jobs[0].language,
         return_time_stamps=want_timestamps,
+        **kwargs,
     )
     output: list[tuple[str, list[dict[str, Any]]]] = []
     for job, result in zip(jobs, results, strict=True):
@@ -242,8 +264,15 @@ async def lifespan(_: FastAPI):
     try:
         started = time.monotonic()
         _model = await asyncio.to_thread(_load_model)
+        # ★ 워밍업 1회 — 정렬기가 transcribe() 시점에 지연 로딩되고 vLLM 도 첫 패스에서
+        # 그래프를 잡는다. 이걸 첫 실요청에 맡기면 그 요청만 수십 초 걸리고, 서버리스에서는
+        # 그 시간이 그대로 과금된다. 무음 1초로 두 비용을 부팅 때 미리 치른다.
+        await asyncio.to_thread(
+            _run_batch,
+            [_Job(audio=np.zeros(SR, dtype=np.float32), language=None, want_timestamps=True)],
+        )
         _ready = True
-        logger.info("모델 로딩 완료 — %.1f초", time.monotonic() - started)
+        logger.info("모델 로딩+워밍업 완료 — %.1f초", time.monotonic() - started)
     except Exception as error:  # noqa: BLE001
         # ★ 여기서 죽지 않는다. 죽으면 RunPod 이 워커를 재시작만 반복해 원인이 안 보인다.
         # /ping 이 503 을 내 unhealthy 로 표시되고, 로그에 사유가 남는다.
@@ -289,7 +318,11 @@ async def transcriptions(request: Request, authorization: str = Header(default="
     want_timestamps = "word" in (body.get("timestamp_granularities") or [])
 
     assert _queue is not None
-    job = _Job(audio=audio, language=body.get("language"), want_timestamps=want_timestamps)
+    job = _Job(
+        audio=audio,
+        language=_language_name(body.get("language")),
+        want_timestamps=want_timestamps,
+    )
     _queue.put_nowait(job)
     text, words = await job.future
 
