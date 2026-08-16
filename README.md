@@ -61,16 +61,23 @@ RunPod 헬스체크. `200` 정상 · `204` 초기화 중 · `503` 로딩 실패(
 
 ## 배포 (RunPod)
 
-1. 이 레포를 github.com 에 올린다(사내 엔터프라이즈 GitHub 은 RunPod 이 못 읽는다).
-2. RunPod 콘솔 → Serverless → New endpoint → **Deploy from a GitHub repository** →
-   이 레포 선택. RunPod 이 amd64 로 빌드하므로 로컬에서 CUDA 이미지를 구울 필요가 없다.
-3. **Endpoint type 을 Load balancer 로** 둔다(Queue 아님 — 위 "왜" 참고).
-4. GPU 24GB 급(L4 권장 — 1.7B+0.6B 합쳐 ~8GB 라 충분하고 24GB 중 가장 싸다).
-5. Max workers 는 계정 한도 안에서. Idle timeout 은 회의가 띄엄띄엄 들어오므로 짧게.
-6. 배포 후 `https://<ENDPOINT_ID>.api.runpod.ai/ping` 이 200 이 되는지 먼저 확인한다.
+1. 이 레포를 github.com 에 올린다(사내 엔터프라이즈 GitHub 은 Actions·RunPod 어느 쪽도
+   쓸 수 없다).
+2. push 하면 `.github/workflows/build.yml` 이 amd64 이미지를 구워
+   `ghcr.io/<owner>/<repo>:latest` 로 올린다. 맥(arm64)에서 CUDA 이미지를 구울 필요가 없다.
+3. ghcr 패키지를 **public 으로 바꾸거나**, private 로 두고 RunPod 엔드포인트에 registry
+   credential 을 등록한다.
+4. RunPod 콘솔 → Serverless → New endpoint → **Deploy from a Docker image** → 위 이미지.
+5. **Endpoint type 을 Load balancer 로** 둔다(Queue 아님 — 위 "왜" 참고).
+6. GPU 24GB 급(L4 권장 — 1.7B+0.6B 합쳐 ~8GB 라 충분하고 24GB 중 가장 싸다).
+7. **네트워크 볼륨을 붙이고 `HF_HOME=/runpod-volume/hf` 를 준다.** 아래 ⚠️ 참고.
+8. 배포 후 `https://<ENDPOINT_ID>.api.runpod.ai/ping` 이 200 이 되는지 먼저 확인한다.
 
-⚠️ 첫 빌드는 가중치를 이미지에 굽느라(`BAKE_WEIGHTS=1`) 오래 걸린다. 굽지 않으려면
-build arg 를 `0` 으로 두고 네트워크 볼륨에 `HF_HOME` 을 얹는다 — 대신 콜드스타트가 길어진다.
+⚠️ **가중치는 이미지에 굽지 않는다**(CI 가 `BAKE_WEIGHTS=0`). GitHub 호스티드 러너 디스크가
+베이스 8GB + 가중치 8GB + 레이어 사본을 못 버틴다. 그래서 첫 부팅에 HF 에서 ~8GB 를 받는데,
+**네트워크 볼륨에 `HF_HOME` 을 얹어두면 그 다운로드가 워커 간에 공유돼 한 번만 일어난다.**
+볼륨 없이 띄우면 워커가 뜰 때마다 8GB 를 받고 그 시간이 그대로 과금된다.
+self-hosted 러너가 있으면 `BAKE_WEIGHTS=1` 로 올려 이미지에 굽는 편이 콜드스타트에 가장 좋다.
 
 ## BE 연결
 
