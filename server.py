@@ -119,13 +119,22 @@ async def diarize(
         ann = getattr(out, "exclusive_speaker_diarization", None)
         if ann is None:
             ann = getattr(out, "speaker_diarization", out)
+        # pyannote 4.x 의 itertracks(yield_label=True) 는 (segment, track, label) **3튜플**이다 —
+        # 2튜플로 풀면 ValueError(로컬 재현으로 잡은 첫 500 의 정체).
         turns = [
-            {"start": round(float(t.start), 3), "end": round(float(t.end), 3), "speaker": str(s)}
-            for t, s in ann.itertracks(yield_label=True)
+            {"start": round(float(seg.start), 3), "end": round(float(seg.end), 3), "speaker": str(label)}
+            for seg, _track, label in ann.itertracks(yield_label=True)
         ]
         return turns, waveform.shape[1] / sr
 
-    turns, dur = await asyncio.to_thread(_run)
+    try:
+        turns, dur = await asyncio.to_thread(_run)
+    except Exception as e:  # noqa: BLE001
+        # 사유를 응답에 싣는다 — 서버리스 워커의 로그는 콘솔에서 뒤지기 어렵다(실측: FastAPI 기본
+        # 500 "Internal Server Error" 만 보고 원인을 못 찾아 로컬 재현까지 갔다). 사내 도구라 노출
+        # 위험보다 진단 가능성이 우선.
+        log.exception("diarize 실패")
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
     took = time.time() - t0
     log.info("diarize %.0fs 오디오 → turn %d · 화자 %d · %.1fs (RTF %.3f)",
              dur, len(turns), len({t['speaker'] for t in turns}), took, took / max(dur, 1e-6))
