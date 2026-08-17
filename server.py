@@ -16,12 +16,12 @@ import asyncio
 import io
 import logging
 import os
+import subprocess
 import time
 import uuid
 
 import httpx
 import numpy as np
-import soundfile as sf
 import torch
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
@@ -114,11 +114,17 @@ def _diarize_sync(raw: bytes, num_speakers, min_speakers, max_speakers):
     """실제 화자분리 — 스레드에서 돈다. (segment, track, label) 3튜플 주의(pyannote 4)."""
     p = _pipeline
     assert p is not None
-    # torchaudio.load 대신 soundfile — pyannote 4.x 가 끌고 오는 torchcodec 은 FFmpeg 공유
-    # 라이브러리를 요구해 베이스 이미지에서 import 가 깨질 수 있다. soundfile 은 이미 있고
-    # wav/flac/ogg 를 직접 읽는다(BE 는 FLAC 을 보낸다).
-    data, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)  # (frames, ch)
-    mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+    # ffmpeg 로 16kHz mono float32 PCM 으로 디코드한다. soundfile 은 ffmpeg 가 파이프로 쓴
+    # FLAC(STREAMINFO 에 총 프레임 수 없음)을 만나면 frames=-1 로 잡아 "array is too big"
+    # 을 낸다(57분 실측 — 15.8분은 우연히 통과). ffmpeg 는 컨테이너·헤더와 무관하게 읽는다.
+    sr = 16000
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "f32le", "-ac", "1", "-ar", str(sr), "pipe:1"],
+        input=raw, capture_output=True, check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        raise RuntimeError(f"ffmpeg 디코드 실패: {proc.stderr.decode(errors='replace')[:200]}")
+    mono = np.frombuffer(proc.stdout, dtype=np.float32)
     waveform = torch.from_numpy(np.ascontiguousarray(mono)).unsqueeze(0)  # (1, frames)
     kwargs = {}
     if num_speakers:
