@@ -4,7 +4,7 @@ name: build and push image
 # RunPod 에 레포 접근 권한을 주지 않아도 된다(이미지만 당겨간다).
 on:
   push:
-    branches: [main]
+    branches: [main, "bisect/**"]
     # 문서만 고칠 때 6분짜리 이미지 빌드를 돌리지 않는다.
     paths-ignore: ['**.md']
   workflow_dispatch:
