@@ -166,31 +166,24 @@ def _reap_jobs():
 
 
 @app.post("/diarize")
-async def diarize_start(
+async def diarize_sync_endpoint(
     file: UploadFile = File(...),
     num_speakers: int | None = Form(None),
     min_speakers: int | None = Form(None),
     max_speakers: int | None = Form(None),
 ):
-    """multipart 오디오 → **즉시** {job_id}. 결과는 GET /diarize/{job_id} 로 폴링.
-
-    업로더가 적은 참석자 수는 num_speakers 로 그대로 싣는다. 결과는
-    exclusive_speaker_diarization — 겹치는 발화를 화자 하나로 정리한 출력이라 BE 의
-    '조각 = 화자 하나' 청킹에 바로 쓸 수 있다."""
-    _reap_jobs()
+    """bisect B — v7 과 같은 동기 처리(요청 안에서 완료) + lock 유지."""
+    await _get_pipeline()
     raw = await file.read()
-    job_id = uuid.uuid4().hex
-    _jobs[job_id] = {"status": "running", "created_at": time.time()}
-    asyncio.create_task(_run_job(job_id, raw, num_speakers, min_speakers, max_speakers))
-    return {"job_id": job_id, "status": "running"}
-
-
-@app.get("/diarize/{job_id}")
-async def diarize_status(job_id: str):
-    job = _jobs.get(job_id)
-    if job is None:
-        return JSONResponse({"error": "unknown job"}, status_code=404)
-    return {"job_id": job_id, **{k: v for k, v in job.items() if k not in ("created_at", "finished_at")}}
+    t0 = time.time()
+    async with _infer_lock:
+        try:
+            turns, dur = await asyncio.to_thread(_diarize_sync, raw, num_speakers, min_speakers, max_speakers)
+        except Exception as e:  # noqa: BLE001
+            log.exception("diarize 실패")
+            return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+    took = time.time() - t0
+    return {"turns": turns, "duration": dur, "model": DIARIZE_MODEL, "took": round(took, 2)}
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
