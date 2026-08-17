@@ -17,6 +17,7 @@ import io
 import logging
 import os
 import time
+import uuid
 
 import httpx
 import numpy as np
@@ -34,6 +35,12 @@ HF_TOKEN = os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN"
 
 app = FastAPI()
 _pipeline = None
+# 비동기 job 저장소 — RunPod LB 는 요청 하나를 ~38초에 끊는다(실측). 화자분리는 15.8분에 27초,
+# 60분이면 ~95초라 한 요청 안에 못 끝난다. POST 는 job_id 를 즉시 돌려주고 GET 으로 폴링한다.
+# 워커 1대·job 은 짧게 살다 지워지므로 프로세스 메모리로 충분하다(워커가 죽으면 job 도 죽고
+# BE 가 재시도한다).
+_jobs: dict[str, dict] = {}
+_JOB_TTL_SEC = 1800.0
 _pipeline_lock = asyncio.Lock()
 _client = httpx.AsyncClient(base_url=VLLM, timeout=httpx.Timeout(600.0))
 
@@ -66,6 +73,11 @@ async def _warm():
     # /health 가 not-ready 를 돌려주므로 LB 가 트래픽을 안 흘린다.
     try:
         await _get_pipeline()
+        # 첫 추론 페널티(GPU 커널 컴파일)를 여기서 태운다 — 실측: 로드 직후 첫 /diarize 가
+        # 2분 조각에서 38초를 넘겨 LB 502, 그 다음부터는 3초. 5초 무음이면 충분하다.
+        t0 = time.time()
+        await asyncio.to_thread(_diarize_sync, _silence_wav(5.0), None, None, None)
+        log.info("pyannote 첫 추론 예열 %.1fs", time.time() - t0)
     except Exception:  # noqa: BLE001
         log.exception("pyannote 예열 실패 — /health 가 503 을 유지한다")
 
@@ -84,61 +96,90 @@ async def health():
     return {"status": "ok"}
 
 
+def _silence_wav(sec: float) -> bytes:
+    buf = io.BytesIO()
+    sf.write(buf, np.zeros(int(16000 * sec), dtype="float32"), 16000, format="WAV")
+    return buf.getvalue()
+
+
+def _diarize_sync(raw: bytes, num_speakers, min_speakers, max_speakers):
+    """실제 화자분리 — 스레드에서 돈다. (segment, track, label) 3튜플 주의(pyannote 4)."""
+    p = _pipeline
+    assert p is not None
+    # torchaudio.load 대신 soundfile — pyannote 4.x 가 끌고 오는 torchcodec 은 FFmpeg 공유
+    # 라이브러리를 요구해 베이스 이미지에서 import 가 깨질 수 있다. soundfile 은 이미 있고
+    # wav/flac/ogg 를 직접 읽는다(BE 는 FLAC 을 보낸다).
+    data, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)  # (frames, ch)
+    mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+    waveform = torch.from_numpy(np.ascontiguousarray(mono)).unsqueeze(0)  # (1, frames)
+    kwargs = {}
+    if num_speakers:
+        kwargs["num_speakers"] = num_speakers
+    else:
+        if min_speakers:
+            kwargs["min_speakers"] = min_speakers
+        if max_speakers:
+            kwargs["max_speakers"] = max_speakers
+    out = p({"waveform": waveform, "sample_rate": sr}, **kwargs)
+    ann = getattr(out, "exclusive_speaker_diarization", None)
+    if ann is None:
+        ann = getattr(out, "speaker_diarization", out)
+    turns = [
+        {"start": round(float(seg.start), 3), "end": round(float(seg.end), 3), "speaker": str(label)}
+        for seg, _track, label in ann.itertracks(yield_label=True)
+    ]
+    return turns, waveform.shape[1] / sr
+
+
+async def _run_job(job_id: str, raw: bytes, num_speakers, min_speakers, max_speakers):
+    job = _jobs[job_id]
+    t0 = time.time()
+    try:
+        await _get_pipeline()
+        turns, dur = await asyncio.to_thread(_diarize_sync, raw, num_speakers, min_speakers, max_speakers)
+        took = time.time() - t0
+        job.update(status="done", turns=turns, duration=dur, took=round(took, 2), model=DIARIZE_MODEL)
+        log.info("diarize job=%s %.0fs 오디오 → turn %d · 화자 %d · %.1fs (RTF %.3f)",
+                 job_id, dur, len(turns), len({x["speaker"] for x in turns}), took, took / max(dur, 1e-6))
+    except Exception as e:  # noqa: BLE001
+        log.exception("diarize job=%s 실패", job_id)
+        job.update(status="failed", error=f"{type(e).__name__}: {e}")
+    finally:
+        job["finished_at"] = time.time()
+
+
+def _reap_jobs():
+    now = time.time()
+    for k in [k for k, j in _jobs.items() if j.get("finished_at") and now - j["finished_at"] > _JOB_TTL_SEC]:
+        _jobs.pop(k, None)
+
+
 @app.post("/diarize")
-async def diarize(
+async def diarize_start(
     file: UploadFile = File(...),
     num_speakers: int | None = Form(None),
     min_speakers: int | None = Form(None),
     max_speakers: int | None = Form(None),
 ):
-    """multipart 오디오 → 화자 turn 목록. 업로더가 적은 참석자 수는 num_speakers 로 그대로 싣는다.
+    """multipart 오디오 → **즉시** {job_id}. 결과는 GET /diarize/{job_id} 로 폴링.
 
-    exclusive_speaker_diarization 을 돌려준다 — 겹치는 발화를 화자 하나로 정리한 출력이라
-    BE 의 '조각 = 화자 하나' 청킹에 바로 쓸 수 있다."""
-    p = await _get_pipeline()
+    업로더가 적은 참석자 수는 num_speakers 로 그대로 싣는다. 결과는
+    exclusive_speaker_diarization — 겹치는 발화를 화자 하나로 정리한 출력이라 BE 의
+    '조각 = 화자 하나' 청킹에 바로 쓸 수 있다."""
+    _reap_jobs()
     raw = await file.read()
-    t0 = time.time()
+    job_id = uuid.uuid4().hex
+    _jobs[job_id] = {"status": "running", "created_at": time.time()}
+    asyncio.create_task(_run_job(job_id, raw, num_speakers, min_speakers, max_speakers))
+    return {"job_id": job_id, "status": "running"}
 
-    def _run():
-        # torchaudio.load 대신 soundfile — pyannote 4.x 가 끌고 오는 torchcodec 은 FFmpeg 공유
-        # 라이브러리를 요구해 베이스 이미지에서 import 가 깨질 수 있다. soundfile 은 이미 있고
-        # wav/flac/ogg 를 직접 읽는다(BE 는 FLAC 을 보낸다).
-        data, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)  # (frames, ch)
-        mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
-        waveform = torch.from_numpy(np.ascontiguousarray(mono)).unsqueeze(0)  # (1, frames)
-        kwargs = {}
-        if num_speakers:
-            kwargs["num_speakers"] = num_speakers
-        else:
-            if min_speakers:
-                kwargs["min_speakers"] = min_speakers
-            if max_speakers:
-                kwargs["max_speakers"] = max_speakers
-        out = p({"waveform": waveform, "sample_rate": sr}, **kwargs)
-        # 4.x 는 exclusive 를 주고, 혹시 없으면(구버전) 일반 diarization 으로 떨어진다.
-        ann = getattr(out, "exclusive_speaker_diarization", None)
-        if ann is None:
-            ann = getattr(out, "speaker_diarization", out)
-        # pyannote 4.x 의 itertracks(yield_label=True) 는 (segment, track, label) **3튜플**이다 —
-        # 2튜플로 풀면 ValueError(로컬 재현으로 잡은 첫 500 의 정체).
-        turns = [
-            {"start": round(float(seg.start), 3), "end": round(float(seg.end), 3), "speaker": str(label)}
-            for seg, _track, label in ann.itertracks(yield_label=True)
-        ]
-        return turns, waveform.shape[1] / sr
 
-    try:
-        turns, dur = await asyncio.to_thread(_run)
-    except Exception as e:  # noqa: BLE001
-        # 사유를 응답에 싣는다 — 서버리스 워커의 로그는 콘솔에서 뒤지기 어렵다(실측: FastAPI 기본
-        # 500 "Internal Server Error" 만 보고 원인을 못 찾아 로컬 재현까지 갔다). 사내 도구라 노출
-        # 위험보다 진단 가능성이 우선.
-        log.exception("diarize 실패")
-        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
-    took = time.time() - t0
-    log.info("diarize %.0fs 오디오 → turn %d · 화자 %d · %.1fs (RTF %.3f)",
-             dur, len(turns), len({t['speaker'] for t in turns}), took, took / max(dur, 1e-6))
-    return {"turns": turns, "duration": dur, "model": DIARIZE_MODEL, "took": round(took, 2)}
+@app.get("/diarize/{job_id}")
+async def diarize_status(job_id: str):
+    job = _jobs.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "unknown job"}, status_code=404)
+    return {"job_id": job_id, **{k: v for k, v in job.items() if k not in ("created_at", "finished_at")}}
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
