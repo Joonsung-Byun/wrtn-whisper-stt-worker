@@ -77,11 +77,10 @@ async def _warm():
     # /health 가 not-ready 를 돌려주므로 LB 가 트래픽을 안 흘린다.
     try:
         await _get_pipeline()
-        # 첫 추론 페널티(GPU 커널 컴파일)를 여기서 태운다 — 실측: 로드 직후 첫 /diarize 가
-        # 2분 조각에서 38초를 넘겨 LB 502, 그 다음부터는 3초. 5초 무음이면 충분하다.
-        t0 = time.time()
-        await asyncio.to_thread(_diarize_sync, _silence_wav(5.0), None, None, None)
-        log.info("pyannote 첫 추론 예열 %.1fs", time.time() - t0)
+        # ⚠️ 무음 예열은 하지 않는다. v8 에서 5초 무음으로 첫 추론을 태웠더니 그 뒤 모든 추론이
+        # **13배 느려졌다**(15.8분 27s → 346s, 2분 3s → 52s · 같은 코드에서 예열만 뺀 v7 은 빠름 —
+        # 2026-08-17 클린 워커 A/B). 원인은 pyannote 가 첫 입력으로 내부 상태를 잡는 것으로
+        # 보이며(빈 입력 → 퇴화), 첫 추론 페널티는 BE 의 예열(실오디오 30초)이 흡수한다.
     except Exception:  # noqa: BLE001
         log.exception("pyannote 예열 실패 — /health 가 503 을 유지한다")
 
@@ -109,12 +108,6 @@ async def health():
     except httpx.HTTPError as e:
         return JSONResponse({"status": f"vllm unreachable: {type(e).__name__}"}, status_code=503)
     return {"status": "ok"}
-
-
-def _silence_wav(sec: float) -> bytes:
-    buf = io.BytesIO()
-    sf.write(buf, np.zeros(int(16000 * sec), dtype="float32"), 16000, format="WAV")
-    return buf.getvalue()
 
 
 def _diarize_sync(raw: bytes, num_speakers, min_speakers, max_speakers):
