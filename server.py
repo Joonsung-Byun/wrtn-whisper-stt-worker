@@ -144,10 +144,7 @@ async def _run_job(job_id: str, raw: bytes, num_speakers, min_speakers, max_spea
     t0 = time.time()
     try:
         await _get_pipeline()
-        job["status"] = "queued"
-        async with _infer_lock:
-            job["status"] = "running"
-            turns, dur = await asyncio.to_thread(_diarize_sync, raw, num_speakers, min_speakers, max_speakers)
+        turns, dur = await asyncio.to_thread(_diarize_sync, raw, num_speakers, min_speakers, max_speakers)
         took = time.time() - t0
         job.update(status="done", turns=turns, duration=dur, took=round(took, 2), model=DIARIZE_MODEL)
         log.info("diarize job=%s %.0fs 오디오 → turn %d · 화자 %d · %.1fs (RTF %.3f)",
