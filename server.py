@@ -42,6 +42,10 @@ _pipeline = None
 _jobs: dict[str, dict] = {}
 _JOB_TTL_SEC = 1800.0
 _pipeline_lock = asyncio.Lock()
+# ★ 추론은 한 번에 하나만. 파이프라인 객체가 하나(GPU 하나)라 동시 실행은 이득이 없고,
+# to_thread 로 여러 추론이 겹치면 GPU·GIL 을 서로 밀어내 전부 느려진다(실측 2026-08-17:
+# job 이 겹친 뒤 30초 오디오가 1초 → 17초, vLLM 전사까지 5.5초 → 30초로 끌려갔다).
+_infer_lock = asyncio.Lock()
 _client = httpx.AsyncClient(base_url=VLLM, timeout=httpx.Timeout(600.0))
 
 
@@ -80,6 +84,17 @@ async def _warm():
         log.info("pyannote 첫 추론 예열 %.1fs", time.time() - t0)
     except Exception:  # noqa: BLE001
         log.exception("pyannote 예열 실패 — /health 가 503 을 유지한다")
+
+
+@app.get("/diarize-stats")
+async def diarize_stats():
+    """진단용 — GPU 사용 여부·job 큐 상태. 콘솔 로그가 안 보이는 서버리스에서 이게 눈이다."""
+    return {
+        "cuda": torch.cuda.is_available(),
+        "device": str(next(_pipeline._segmentation.model.parameters()).device) if _pipeline is not None else None,
+        "jobs": {k: v.get("status") for k, v in _jobs.items()},
+        "infer_locked": _infer_lock.locked(),
+    }
 
 
 @app.get("/health")
@@ -136,7 +151,10 @@ async def _run_job(job_id: str, raw: bytes, num_speakers, min_speakers, max_spea
     t0 = time.time()
     try:
         await _get_pipeline()
-        turns, dur = await asyncio.to_thread(_diarize_sync, raw, num_speakers, min_speakers, max_speakers)
+        job["status"] = "queued"
+        async with _infer_lock:
+            job["status"] = "running"
+            turns, dur = await asyncio.to_thread(_diarize_sync, raw, num_speakers, min_speakers, max_speakers)
         took = time.time() - t0
         job.update(status="done", turns=turns, duration=dur, took=round(took, 2), model=DIARIZE_MODEL)
         log.info("diarize job=%s %.0fs 오디오 → turn %d · 화자 %d · %.1fs (RTF %.3f)",
